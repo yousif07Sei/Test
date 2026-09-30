@@ -1,0 +1,9 @@
+[Unit]
+Description=App @ENV_LABEL@ - Laravel scheduler tick
+
+[Service]
+Type=oneshot
+User=@WEB_USER@
+Group=@WEB_USER@
+WorkingDirectory=@APP_ROOT@
+ExecStart=/usr/bin/php artisan schedule:run

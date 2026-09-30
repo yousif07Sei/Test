@@ -1,0 +1,10 @@
+[Unit]
+Description=App @ENV_LABEL@ - run the Laravel scheduler every minute
+
+[Timer]
+OnCalendar=*:0/1
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

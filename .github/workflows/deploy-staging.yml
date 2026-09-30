@@ -1,0 +1,55 @@
+name: Deploy staging
+
+# Staging tracks `development` automatically, but only once CI is green:
+# deploying a commit whose tests failed just moves the breakage somewhere more
+# expensive. Production tracks `main`; see deploy-production.yml.
+#
+# Off until a box exists: set the repository variable DEPLOY_ENABLED=true once
+# a runner labelled [self-hosted, app, staging] is registered (docs/devops.md).
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [development]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to staging
+    # Self-hosted: the box sits on a private network that GitHub-hosted runners
+    # cannot reach, so the runner lives on the box and dials out to GitHub.
+    runs-on: [self-hosted, app, staging]
+    # Only a CI run for a *push* to development deploys. `branches:` above
+    # matches the branch a CI run was for, whatever started it, so a pull
+    # request from development (the release PR into main) would redeploy
+    # staging a second time, and so would a fork's PR from a branch it named
+    # `development`. The repository check closes the fork case outright.
+    if: >-
+      vars.DEPLOY_ENABLED == 'true' && (
+        github.event_name == 'workflow_dispatch' || (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+
+    steps:
+      # Atomic: unpack, boot-check and migrate a release, then switch to it,
+      # and switch back if /up fails. See scripts/app-deploy.
+      - name: Deploy
+        run: sudo /usr/local/sbin/app-deploy staging github/development
+
+      - name: Smoke test
+        env:
+          URL: ${{ vars.STAGING_URL }}
+        run: /var/www/app/current/scripts/smoke-test.sh "$URL"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::Staging deploy failed. If it failed before the switch the live" \
+               "release was not touched; the database backup is in shared/storage/backups."

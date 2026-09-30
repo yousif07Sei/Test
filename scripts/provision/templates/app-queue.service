@@ -1,0 +1,15 @@
+[Unit]
+Description=App @ENV_LABEL@ - Laravel queue worker
+After=network.target
+
+[Service]
+Type=simple
+User=@WEB_USER@
+Group=@WEB_USER@
+WorkingDirectory=@APP_ROOT@
+ExecStart=/usr/bin/php artisan queue:work --sleep=3 --tries=3 --max-time=3600
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

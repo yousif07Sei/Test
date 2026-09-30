@@ -1,0 +1,7 @@
+# Managed by scripts/provision.sh. The runner gets root for these two scripts
+# and nothing else: deploying the app, and provisioning the machine.
+#
+# app-deploy is installed by provisioning outside the tree it deploys, so
+# what root runs changes only when a box is provisioned.
+@RUNNER_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/app-deploy
+@RUNNER_USER@ ALL=(root) NOPASSWD: @APP_ROOT@/scripts/provision.sh

@@ -1,0 +1,55 @@
+name: Provision
+
+# Machine setup, not app deploys: the Apache vhost, the app-* systemd units,
+# the runner's sudoers rule and the installed deploy script. See
+# scripts/provision.sh and docs/devops.md.
+#
+# Manual only. A plan always runs first and changes nothing; its log is the
+# diff of what would change. Tick "apply" to make the changes. Applying goes
+# through the environment of the same name, so production waits for the same
+# approval a production deploy does.
+#
+# It runs the provision.sh that is deployed on the box, so a template change
+# reaches a box by deploying it first and provisioning second.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Which box'
+        type: choice
+        options: [staging, production]
+        required: true
+      apply:
+        description: 'Apply the changes (unticked = plan only)'
+        type: boolean
+        default: false
+
+# The same groups the deploys use, so provisioning and a deploy never run on
+# the same box at once.
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan (${{ inputs.environment }})
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: [self-hosted, app, "${{ inputs.environment }}"]
+    steps:
+      - name: Show what would change
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: sudo /var/www/app/current/scripts/provision.sh "$TARGET"
+
+  apply:
+    name: Apply (${{ inputs.environment }})
+    needs: plan
+    if: inputs.apply
+    # Production's environment has required reviewers: this is the approval.
+    environment: ${{ inputs.environment }}
+    runs-on: [self-hosted, app, "${{ inputs.environment }}"]
+    steps:
+      - name: Apply
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: sudo /var/www/app/current/scripts/provision.sh "$TARGET" --apply

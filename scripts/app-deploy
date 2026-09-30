@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+#
+# Atomic deploys. Installed by scripts/provision.sh as /usr/local/sbin/app-deploy;
+# the runner's sudoers rule names that path and nothing else.
+#
+#   app-deploy <staging|production> [git-ref]   deploy CI's build of it and switch to it
+#   app-deploy <staging|production> <git-ref> --build-here
+#                                               build it on the box instead (no CI build)
+#   app-deploy <staging|production> rollback    switch back to the previous release
+#   app-deploy <staging|production> status      list releases, mark the live one
+#
+# Layout:
+#
+#   $APP_DIR/repo.git          the git source; fetched, never checked out
+#   $APP_DIR/releases/<id>/    one per deploy: <UTC timestamp>-<short sha>
+#   $APP_DIR/shared/.env       the box's only .env
+#   $APP_DIR/shared/storage/   logs, sessions, uploads, backups
+#   $APP_DIR/current           -> releases/<id>, the only thing that switches
+#
+# The rule this script exists to keep: **nothing touches `current` until the
+# new release has unpacked, booted and migrated.** A failure before the switch
+# leaves the live site exactly as it was. A failed health check after it
+# switches straight back.
+#
+# Test hooks (CI runs this against a throwaway APP_DIR): APP_DIR, BUILD_REMOTE, WEB_USER,
+# KEEP_RELEASES, HEALTH_URL, RETRY_DELAY, SKIP_SERVICES=1 (no systemctl), SKIP_FRONTEND=1
+# (no npm), SKIP_CHOWN=1.
+#
+set -euo pipefail
+
+ENVIRONMENT="${1:?usage: app-deploy <staging|production> [git-ref [--build-here]|rollback|status]}"
+ACTION="${2:-}"
+BUILD_HERE=
+case "${3:-}" in
+  "") ;;
+  --build-here) BUILD_HERE=1 ;;
+  *) echo "error: unknown option '$3'" >&2; exit 2 ;;
+esac
+
+case "$ENVIRONMENT" in
+  staging) DEFAULT_REF="github/development" ;;
+  production) DEFAULT_REF="github/main" ;;
+  *) echo "error: environment must be 'staging' or 'production', got '$ENVIRONMENT'" >&2; exit 2 ;;
+esac
+
+APP_DIR="${APP_DIR:-/var/www/app}"
+WEB_USER="${WEB_USER:-www-data}"
+KEEP_RELEASES="${KEEP_RELEASES:-5}"
+REPO="$APP_DIR/repo.git"
+# The GitHub remote in repo.git: where CI publishes refs/builds/<sha>.
+BUILD_REMOTE="${BUILD_REMOTE:-github}"
+RELEASES="$APP_DIR/releases"
+SHARED="$APP_DIR/shared"
+CURRENT="$APP_DIR/current"
+
+log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+warn() { printf '\n\033[1;33m!!> %s\033[0m\n' "$*" >&2; }
+die() { printf '\n\033[1;31mxx> %s\033[0m\n' "$*" >&2; exit 1; }
+
+[ -d "$RELEASES" ] && [ -d "$SHARED" ] && [ -d "$REPO" ] \
+  || die "$APP_DIR is not in the releases layout (no releases/, shared/ or repo.git).
+    Set a box up first; see docs/devops.md."
+
+# One deploy at a time per box. The workflows serialise too, but a hand-run
+# deploy or rollback must not interleave with one from Actions.
+exec 9>"$SHARED/.deploy.lock"
+flock -n 9 || die "another deploy or rollback is running on this box"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+live_release() { [ -L "$CURRENT" ] && basename "$(readlink "$CURRENT")" || true; }
+
+# Releases, oldest first. Ids start with a UTC timestamp, so name order is
+# deploy order.
+list_releases() { find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort; }
+
+# Point `current` at a release in one rename(2): a request sees the old
+# release or the new one, never a missing or half-written link.
+switch_to() {
+  local id="$1"
+  ln -sfn "releases/$id" "$APP_DIR/.current.next"
+  mv -Tf "$APP_DIR/.current.next" "$CURRENT"
+  note "current -> releases/$id"
+}
+
+env_value() { grep -E "^$1=" "$SHARED/.env" | tail -1 | cut -d= -f2- | tr -d '"' || true; }
+
+# GitHub's SSH endpoint refuses a key now and then for a few seconds
+# ("Permission denied (publickey)") with the key perfectly fine. Nothing has
+# been touched yet at this point, so trying again is safe.
+with_retry() {
+  local n
+  for n in 1 2 3 4; do
+    "$@" && return 0
+    [ "$n" = 4 ] && break
+    warn "attempt $n of: $* failed; retrying in $((n * ${RETRY_DELAY:-5}))s"
+    sleep $((n * ${RETRY_DELAY:-5}))
+  done
+  return 1
+}
+
+# Reload what caches the old paths: mod_php's realpath cache (a graceful
+# reload replaces the workers) and the long-running workers, whose
+# WorkingDirectory systemd resolved through `current` when they started.
+reload_services() {
+  if [ "${SKIP_SERVICES:-}" = 1 ]; then note "services skipped (SKIP_SERVICES=1)"; return; fi
+  (cd "$CURRENT" && php artisan queue:restart --quiet) || warn "queue:restart failed"
+  local unit
+  for unit in app-queue; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      systemctl restart "$unit"
+      systemctl is-active --quiet "$unit" || warn "$unit did not come back up: systemctl status $unit"
+      note "restarted $unit"
+    else
+      warn "$unit is not enabled on this box. Run: sudo provision.sh $ENVIRONMENT --apply"
+    fi
+  done
+  if systemctl is-active --quiet apache2; then
+    systemctl reload apache2
+    note "reloaded apache2"
+  fi
+}
+
+# /up through Apache, as the reverse proxy would send it: the Host is APP_URL's.
+health_ok() {
+  local url="${HEALTH_URL:-}" host
+  if [ -z "$url" ]; then
+    host=$(env_value APP_URL | sed -E 's#^[a-z]+://##; s#/.*$##')
+    url="http://127.0.0.1/up"
+    set -- -H "Host: ${host:-localhost}" -H 'X-Forwarded-Proto: https'
+  else
+    set --
+  fi
+  local i code
+  for i in 1 2 3 4 5; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" "$url" || true)
+    [ "$code" = 200 ] && { note "/up answered 200"; return 0; }
+    sleep 2
+  done
+  note "/up answered ${code:-nothing} after 5 tries"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = status ]; then
+  live=$(live_release)
+  list_releases | while read -r id; do
+    [ "$id" = "$live" ] && echo "* $id   (live)" || echo "  $id"
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# rollback: the release before the live one. The database is left alone:
+# migrations are forward-only, and the previous release must already run on
+# this schema (expand-then-contract). To undo a migration, restore the backup
+# the deploy took; see docs/devops.md.
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = rollback ]; then
+  live=$(live_release)
+  [ -n "$live" ] || die "no live release to roll back from"
+  previous=$(list_releases | grep -B1 -x -- "$live" | head -1)
+  [ -n "$previous" ] && [ "$previous" != "$live" ] || die "no release older than $live to roll back to"
+  log "Rolling $ENVIRONMENT back: $live -> $previous"
+  switch_to "$previous"
+  (cd "$CURRENT" && php artisan optimize:clear --quiet) || warn "optimize:clear failed"
+  reload_services
+  health_ok || die "rolled back to $previous, but /up is still failing. Check the Apache and Laravel logs"
+  log "Rolled back to $previous"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# deploy
+# ---------------------------------------------------------------------------
+REF="${ACTION:-$DEFAULT_REF}"
+# The ref reaches git as root, and in CI it comes from a workflow input:
+# validate it here rather than trust the caller.
+case "$REF" in
+  github/main | github/development) ;;
+  *)
+    printf '%s' "$REF" | grep -Eq '^([0-9a-fA-F]{7,40}|v[0-9][A-Za-z0-9._-]*)$' \
+      || die "refusing to deploy ref '$REF': expected github/main, github/development, a v* tag, or a commit SHA"
+    ;;
+esac
+
+PREVIOUS=$(live_release)
+log "Deploying $ENVIRONMENT from $REF (live: ${PREVIOUS:-none})"
+
+log "Fetching"
+with_retry git --git-dir="$REPO" fetch --all --prune --tags --quiet \
+  || die "could not fetch from GitHub after 4 attempts; nothing was changed"
+SHA=$(git --git-dir="$REPO" rev-parse --verify --quiet "$REF^{commit}") \
+  || die "ref '$REF' does not resolve to a commit in $REPO"
+ID="$(date -u +%Y%m%dT%H%M%S)-${SHA:0:7}"
+NEW="$RELEASES/$ID"
+note "$REF = $SHA"
+note "release $ID"
+
+# CI builds every push to development and main once, and publishes the result
+# as refs/builds/<sha>: the source plus vendor/ and public/build/. Fetching it
+# here, as root, over the box's own key, is what keeps the runner from being
+# able to hand root something to run. Both boxes unpack the same tree.
+if [ -z "$BUILD_HERE" ]; then
+  with_retry git --git-dir="$REPO" fetch --quiet "$BUILD_REMOTE" "+refs/builds/$SHA:refs/builds/$SHA" 2>/dev/null \
+    || die "CI has not published a build of $SHA (refs/builds/$SHA). Only pushes
+    to development and main are built, once their tests pass. To build this
+    commit on the box instead: app-deploy $ENVIRONMENT $SHA --build-here"
+  [ "$(git --git-dir="$REPO" rev-parse "refs/builds/$SHA^")" = "$SHA" ] \
+    || die "refs/builds/$SHA is not a build of $SHA"
+  SOURCE="refs/builds/$SHA"
+  note "build $(git --git-dir="$REPO" rev-parse "$SOURCE^{tree}") (tree), built by CI"
+else
+  SOURCE="$SHA"
+  note "building on this box (--build-here)"
+fi
+
+# A release that fails before the switch is removed, so it cannot be mistaken
+# for a good one by a later rollback.
+cleanup_failed() {
+  local rc=$?
+  if [ $rc -ne 0 ] && [ -d "$NEW" ] && [ "$(live_release)" != "$ID" ]; then
+    rm -rf "$NEW"
+    warn "deploy failed before the switch; removed releases/$ID. The live site was not touched."
+  fi
+}
+trap cleanup_failed EXIT
+
+log "Unpacking the release"
+mkdir -p "$NEW"
+git --git-dir="$REPO" archive "$SOURCE" | tar -x -C "$NEW"
+# What outlives a release lives in shared/, linked in relatively so the
+# release can be inspected (or moved) without the links breaking.
+rm -rf "$NEW/storage"
+ln -s ../../shared/storage "$NEW/storage"
+ln -s ../../shared/.env "$NEW/.env"
+ln -s ../storage/app/public "$NEW/public/storage"
+
+if [ -n "$BUILD_HERE" ]; then
+  (
+    cd "$NEW"
+    # composer's post-autoload-dump runs package:discover, which boots the app:
+    # the first place a release that cannot boot is caught.
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-interaction --prefer-dist \
+      --no-progress --no-dev --optimize-autoloader --quiet
+    if [ "${SKIP_FRONTEND:-}" != 1 ]; then
+      npm ci --silent --no-audit --no-fund
+      npm run build --silent
+      # Only needed to build. Kept, it would cost ~300 MB per release.
+      rm -rf node_modules
+    fi
+  )
+fi
+
+log "Checking the release boots"
+# Boots the console kernel with every provider and route file: a release that
+# throws while booting fails here, before anything is switched.
+(cd "$NEW" && php artisan about --only=environment >/dev/null && php artisan route:list >/dev/null) \
+  || die "releases/$ID does not boot"
+note "boots"
+
+log "Backing up the database"
+DB_FILE=$(env_value DB_DATABASE)
+if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
+  mkdir -p "$SHARED/storage/backups"
+  BACKUP="$SHARED/storage/backups/database-$(date +%Y%m%d%H%M%S).sqlite"
+  # An online backup, safe while the old release is still writing. A plain cp
+  # of a live SQLite file can tear. PHP's SQLite3::backup is the same API
+  # the sqlite3 CLI uses, for boxes without the CLI.
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DB_FILE" ".backup '$BACKUP'"
+  else
+    php -r '$s = new SQLite3($argv[1], SQLITE3_OPEN_READONLY); $d = new SQLite3($argv[2]);
+            if (! $s->backup($d)) { fwrite(STDERR, "backup failed\n"); exit(1); }' "$DB_FILE" "$BACKUP"
+  fi
+  note "$BACKUP"
+  ls -1t "$SHARED"/storage/backups/database-*.sqlite 2>/dev/null | tail -n +21 | xargs -r rm --
+else
+  warn "no SQLite file at DB_DATABASE='${DB_FILE}'; skipping the backup"
+fi
+
+# Migrations run from the new release against the shared database while the
+# old release still serves. They must be backward-compatible with it
+# (expand, then contract in a later release).
+log "Migrating"
+(cd "$NEW" && php artisan migrate --force)
+
+# The build ran as root. Anything it wrote that the web server must write to
+# later (a log line, a compiled view, the package manifest) is handed back.
+if [ "${SKIP_CHOWN:-}" != 1 ]; then
+  chown -R "$WEB_USER:$WEB_USER" "$NEW/bootstrap/cache" "$SHARED/storage"
+  DB_DIR=$(dirname "${DB_FILE:-/nonexistent/x}")
+  [ -d "$DB_DIR" ] && chown -R "$WEB_USER:$WEB_USER" "$DB_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# The switch. Everything above left `current` alone.
+# ---------------------------------------------------------------------------
+log "Switching"
+switch_to "$ID"
+(cd "$CURRENT" && php artisan optimize:clear --quiet) || warn "optimize:clear failed"
+reload_services
+
+log "Health check"
+if ! health_ok; then
+  if [ -n "$PREVIOUS" ]; then
+    warn "releases/$ID is live but /up is failing; switching back to $PREVIOUS"
+    switch_to "$PREVIOUS"
+    reload_services
+    health_ok || warn "/up is still failing on $PREVIOUS too"
+  fi
+  die "deploy of $ID failed its health check"
+fi
+
+log "Pruning to the last $KEEP_RELEASES releases"
+list_releases | head -n -"$KEEP_RELEASES" | while read -r old; do
+  [ "$old" = "$ID" ] || [ "$old" = "$PREVIOUS" ] && continue
+  rm -rf "${RELEASES:?}/$old"
+  note "removed $old"
+done
+
+# The installed copy of this script is what sudo runs; the release carries the
+# version that was just deployed. Different means provisioning is due.
+if [ -f "$CURRENT/scripts/app-deploy" ] && ! cmp -s "$0" "$CURRENT/scripts/app-deploy"; then
+  warn "this deploy ran an older app-deploy than the release carries.
+    Run the Provision workflow (or: sudo provision.sh $ENVIRONMENT --apply) to install it."
+fi
+
+log "Deployed $ID to $ENVIRONMENT"

@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php:
+    name: PHP tests (${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          # sqlite3/pdo_sqlite: the app's driver, and phpunit runs on :memory:
+          extensions: mbstring, bcmath, intl, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/composer/files
+          key: composer-${{ matrix.php }}-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-${{ matrix.php }}-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      # Catches what a unit suite structurally cannot: a file that does not
+      # parse never gets far enough to fail a test if nothing loads it.
+      - name: PHP syntax check
+        run: |
+          failed=0
+          while IFS= read -r file; do
+            php -l "$file" > /dev/null 2>&1 || { echo "::error file=$file::PHP parse error"; php -l "$file" || true; failed=1; }
+          done < <(find app database routes config tests -name '*.php' -not -path '*/vendor/*')
+          exit $failed
+
+      - name: Check formatting (Pint)
+        run: vendor/bin/pint --test
+
+      - name: Run PHPUnit
+        run: php artisan test
+
+  js:
+    name: JS tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run Vitest
+        run: npm test
+
+      # A green unit suite still ships a broken page if the bundle won't
+      # build, so the build is part of CI rather than only of deploys.
+      - name: Build assets
+        run: npm run build
+
+  scripts:
+    name: Deploy & provision scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # These run as root on the servers, and a script that does not parse
+      # only says so once it is already on a box.
+      - name: Shell syntax check
+        run: for f in scripts/*.sh scripts/app-deploy tests/deploy/*.sh; do bash -n "$f" || exit 1; done
+
+      # Renders both boxes' config the way provision.sh would, without root
+      # and without a server. A template with an unreplaced @PLACEHOLDER@
+      # fails here instead of in a plan on the box.
+      - name: Provisioning templates render
+        run: |
+          for env in staging production; do
+            scripts/provision.sh "$env" --render "$RUNNER_TEMP/provision/$env"
+          done
+
+  atomic-deploy:
+    name: Atomic deploy (end to end)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, bcmath, intl, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-deploy-${{ hashFiles('composer.lock') }}
+
+      # Runs the real app-deploy against a throwaway releases layout:
+      # real git archive, composer, Laravel boot, migrations and HTTP /up. It
+      # covers the switch, a release that cannot boot never going live,
+      # rollback, the automatic switch back on a failed health check, and
+      # pruning. See the header of tests/deploy/atomic-deploy.sh.
+      - name: Deploy, break, roll back, prune
+        run: tests/deploy/atomic-deploy.sh
+
+  # Build once, here, and publish the result for both boxes to deploy.
+  # scripts/build-release.sh records the source plus vendor/, public/build/
+  # and bootstrap/cache/ as a commit and pushes it to refs/builds/<sha>.
+  # app-deploy fetches that ref as root over the box's own key, so the
+  # deploying runner never hands root anything to run. Staging and production
+  # unpack the same tree.
+  #
+  # Only pushes to development and main are built, and only once every test
+  # job is green: a commit that failed its tests has no build, so it cannot
+  # be deployed. Pushing refs/builds/* does not trigger CI (it is not a branch).
+  build:
+    name: Build release
+    needs: [php, js, scripts, atomic-deploy]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 8.2, the version the boxes run, so the optimised autoloader and the
+      # platform check match the machine that will execute them.
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, bcmath, intl, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-build-${{ hashFiles('composer.lock') }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Build and publish refs/builds/${{ github.sha }}
+        run: scripts/build-release.sh --push origin
+
